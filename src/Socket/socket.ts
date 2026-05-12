@@ -685,21 +685,36 @@ export const makeSocket = (config: SocketConfig) => {
 		})
 	}
 
-	const startKeepAliveRequest = () =>
-		(keepAliveReq = setInterval(() => {
+	// === MELDEXZZ PATCH: keepalive tolerante ===
+	// Cambios respecto a Baileys oficial:
+	// 1. Margen de tolerancia subido de 5s a 30s (antes mataba la conexión muy rápido)
+	// 2. Requiere 3 fallos consecutivos antes de matar la conexión (no solo 1)
+	// 3. Si el ping de keepalive falla, NO mata la conexión, solo loguea
+	// Esto reduce reinicios falsos cuando WhatsApp pausa la conexión momentáneamente.
+	const startKeepAliveRequest = () => {
+		let consecutiveFailures = 0
+		const MAX_CONSECUTIVE_FAILURES = 3
+
+		return (keepAliveReq = setInterval(() => {
 			if (!lastDateRecv) {
 				lastDateRecv = new Date()
 			}
 
 			const diff = Date.now() - lastDateRecv.getTime()
-			/*
-				check if it's been a suspicious amount of time since the server responded with our last seen
-				it could be that the network is down
-			*/
-			if (diff > keepAliveIntervalMs + 5000) {
-				void end(new Boom('Connection was lost', { statusCode: DisconnectReason.connectionLost }))
+			// Margen GENEROSO: 30 segundos extra del keepAliveInterval.
+			// Solo matar si llevamos 3 keepalives consecutivos sin respuesta.
+			if (diff > keepAliveIntervalMs + 30_000) {
+				consecutiveFailures++
+				if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+					logger.warn({ consecutiveFailures, diff }, 'keep alive falló múltiples veces, cerrando conexión')
+					void end(new Boom('Connection was lost', { statusCode: DisconnectReason.connectionLost }))
+				} else {
+					logger.warn({ consecutiveFailures, diff }, 'keep alive sin respuesta, dando otra oportunidad')
+				}
 			} else if (ws.isOpen) {
-				// if its all good, send a keep alive request
+				// Reset el contador porque sí recibimos algo recientemente
+				consecutiveFailures = 0
+				// Enviar el ping
 				query({
 					tag: 'iq',
 					attrs: {
@@ -710,12 +725,17 @@ export const makeSocket = (config: SocketConfig) => {
 					},
 					content: [{ tag: 'ping', attrs: {} }]
 				}).catch(err => {
-					logger.error({ trace: err.stack }, 'error in sending keep alive')
+					// El ping falló pero NO matamos la conexión inmediatamente.
+					// Si el problema persiste, el check de tiempo arriba se encargará.
+					logger.warn({ err: err?.message }, 'keep alive ping falló, ignorando')
 				})
 			} else {
-				logger.warn('keep alive called when WS not open')
+				logger.warn('keep alive llamado cuando WS no está abierto')
 			}
 		}, keepAliveIntervalMs))
+	}
+	// === FIN MELDEXZZ PATCH ===
+
 	/** i have no idea why this exists. pls enlighten me */
 	const sendPassiveIq = (tag: 'passive' | 'active') =>
 		query({
